@@ -1,4 +1,6 @@
 import json
+import html
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -11,12 +13,35 @@ from tools.migrate_anki_code_to_rust import (
     extract_deck_notes,
     field_checksum,
     highlight_rust_html,
+    _replace_candidate,
     validate_migrated_deck,
     write_inventory,
 )
 
 
 class MigrationExtractionTests(unittest.TestCase):
+    def test_missing_source_boundary_refuses_already_migrated_field(self):
+        entry = {"source_html": "<pre>print(1)</pre>", "snippet_id": "fixture-1-0-0"}
+        with self.assertRaisesRegex(ValueError, "source boundary"):
+            _replace_candidate("<pre>fn main() {}</pre>", entry, "fn main() {}")
+
+    def test_source_boundary_must_match_requested_ordinal(self):
+        field = "<pre>print(1)</pre><pre>print(2)</pre>"
+        entry = {"source_html": "<pre>print(1)</pre>", "snippet_id": "fixture-1-0-1"}
+        with self.assertRaisesRegex(ValueError, "source boundary"):
+            _replace_candidate(field, entry, "fn main() {}")
+
+    def test_all_highlighted_inventory_sources_roundtrip_exactly(self):
+        inventory = json.loads(Path("docs/superpowers/rust-flashcard-code-inventory.json").read_text())
+        for entry in inventory:
+            if entry["classification"] != "convert":
+                continue
+            source = entry["rust_replacement"]
+            rendered = highlight_rust_html(source)
+            self.assertEqual(html.unescape(re.sub(r"<[^>]+>", "", rendered)), source)
+            self.assertIn("background-color:#1e1e1e", rendered)
+            self.assertIn('class="rust-keyword"', rendered)
+
     def make_deck(self, root: Path) -> Path:
         database = root / "collection.anki2"
         connection = sqlite3.connect(database)
@@ -52,7 +77,7 @@ class MigrationExtractionTests(unittest.TestCase):
 
     def test_highlights_rust_code_inside_code_element(self):
         highlighted = highlight_rust_html('fn main() { println!("hi"); // comment\n}')
-        self.assertIn('<code class="language-rust">', highlighted)
+        self.assertIn('<code class="language-rust"', highlighted)
         self.assertIn('class="rust-keyword"', highlighted)
         self.assertIn('class="rust-string"', highlighted)
         self.assertIn('class="rust-comment"', highlighted)
@@ -131,6 +156,30 @@ class MigrationExtractionTests(unittest.TestCase):
             self.assertIn('main()', changed)
             self.assertIn('href="https://example.com"', changed)
             self.assertIn('src="local.png"', changed)
+
+    def test_validation_rejects_corrupted_rust_even_with_valid_checksum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_deck(root)
+            entry = extract_code_candidates(extract_deck_notes(source))[0].__dict__.copy()
+            entry["rust_replacement"] = "fn main() {}"
+            output = root / "output.apkg"
+            apply_inventory_replacements(source, [entry], output)
+            with zipfile.ZipFile(output) as archive:
+                members = {name: archive.read(name) for name in archive.namelist()}
+            database = root / "corrupted.anki2"
+            database.write_bytes(members["collection.anki2"])
+            connection = sqlite3.connect(database)
+            fields = connection.execute("SELECT flds FROM notes").fetchone()[0].replace("main()", "wrong()")
+            connection.execute("UPDATE notes SET flds = ?, csum = ?", (fields, field_checksum(fields.split("\x1f")[0])))
+            connection.commit()
+            connection.close()
+            members["collection.anki2"] = database.read_bytes()
+            with zipfile.ZipFile(output, "w") as archive:
+                for name, contents in members.items():
+                    archive.writestr(name, contents)
+            with self.assertRaisesRegex(ValueError, "approved replacements"):
+                validate_migrated_deck(source, output, [entry])
 
     def test_every_convert_inventory_entry_has_utf8_replacement(self):
         inventory_path = Path("docs/superpowers/rust-flashcard-code-inventory.json")

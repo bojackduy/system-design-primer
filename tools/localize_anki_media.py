@@ -112,19 +112,12 @@ def _rewrite_field(field: str, asset_dir: Path, filenames: set[str]) -> tuple[st
 
 
 def _normalize_media_manifest(raw_manifest: dict[str, str]) -> dict[str, str]:
-    """Return Anki's filename-to-numeric-member media mapping."""
-    if all(not str(key).isdigit() and str(value).isdigit() for key, value in raw_manifest.items()):
-        return {str(key): str(value) for key, value in raw_manifest.items()}
+    """Return Anki's numeric-member-to-filename legacy media mapping."""
     if all(str(key).isdigit() for key in raw_manifest):
-        return {str(name): str(key) for key, name in raw_manifest.items()}
-    normalized: dict[str, str] = {}
-    next_id = 0
-    for name in raw_manifest.values():
-        while str(next_id) in normalized.values():
-            next_id += 1
-        normalized[str(name)] = str(next_id)
-        next_id += 1
-    return normalized
+        return {str(key): str(name) for key, name in raw_manifest.items()}
+    if all(str(value).isdigit() for value in raw_manifest.values()):
+        return {str(value): str(name) for name, value in raw_manifest.items()}
+    raise ValueError("invalid legacy media manifest")
 
 
 def _extract_archive(archive: zipfile.ZipFile, destination: Path) -> list[str]:
@@ -179,10 +172,13 @@ def localize_deck(deck_path: Path, asset_dir: Path, output_path: Path) -> Locali
         connection.close()
 
         media_manifest = dict(existing_manifest)
-        next_media_id = max((int(value) for value in media_manifest.values()), default=-1) + 1
+        member_by_name = {name: member for member, name in media_manifest.items()}
+        next_media_id = max((int(member) for member in media_manifest), default=-1) + 1
         for name in sorted(localized):
-            if name not in media_manifest:
-                media_manifest[name] = str(next_media_id)
+            if name not in member_by_name:
+                member = str(next_media_id)
+                media_manifest[member] = name
+                member_by_name[name] = member
                 next_media_id += 1
             shutil.copy2(asset_dir / name, extracted / name)
         media_path = extracted / "media"
@@ -190,13 +186,17 @@ def localize_deck(deck_path: Path, asset_dir: Path, output_path: Path) -> Locali
 
         media_sources: dict[str, Path] = {}
         media_members: set[str] = set()
-        for name, member in media_manifest.items():
+        for member, name in media_manifest.items():
             member_path = extracted / member
             name_path = extracted / name
-            if member_path.exists():
+            if name in localized:
+                media_sources[member] = name_path
+            elif member_path.exists():
                 media_sources[member] = member_path
             elif name_path.exists():
                 media_sources[member] = name_path
+            else:
+                raise ValueError(f"media member missing: {member} ({name})")
             media_members.update({name, member})
 
         output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -209,7 +209,7 @@ _RUST_TOKEN_STYLES = {
 
 def highlight_rust_html(source: str) -> str:
     """Render Rust source with inline colors, so Anki needs no external highlighter."""
-    parts: list[str] = ['<code class="language-rust">']
+    parts: list[str] = ['<code class="language-rust" style="display:block;background-color:#1e1e1e;color:#d4d4d4;padding:12px;font-family:monospace;white-space:pre;overflow-x:auto;line-height:1.5;text-align:left">']
     cursor = 0
     for match in _RUST_TOKEN_RE.finditer(source):
         parts.append(html.escape(source[cursor:match.start()], quote=False))
@@ -232,15 +232,15 @@ def highlight_rust_html(source: str) -> str:
 def _replace_candidate(field: str, candidate: dict, replacement: str) -> str:
     source_html = candidate["source_html"]
     occurrence = int(candidate.get("occurrence", int(candidate["snippet_id"].rsplit("-", 1)[-1])))
-    occurrence = min(occurrence, field.count(source_html) - 1)
-    start = -1
-    search_from = 0
-    for _ in range(occurrence + 1):
-        start = field.find(source_html, search_from)
-        if start < 0:
-            raise ValueError(f"source boundary missing for {candidate['snippet_id']}")
-        search_from = start + len(source_html)
-    end = start + len(source_html)
+    regions = list(CODE_BLOCK_RE.finditer(field)) or list(INLINE_CODE_RE.finditer(field))
+    if regions:
+        if occurrence < 0 or occurrence >= len(regions) or regions[occurrence].group(0) != source_html:
+            raise ValueError(f"source boundary mismatch for {candidate['snippet_id']}")
+        start, end = regions[occurrence].span()
+    elif occurrence == 0 and field == source_html:
+        start, end = 0, len(field)
+    else:
+        raise ValueError(f"source boundary missing for {candidate['snippet_id']}")
     highlighted = highlight_rust_html(replacement)
     if source_html.lower().startswith("<pre"):
         updated = re.sub(r"(?is)(<pre\b[^>]*>).*?(</pre>)", lambda match: match.group(1) + highlighted + match.group(2), source_html, count=1)
@@ -301,6 +301,17 @@ def validate_migrated_deck(source_path: Path, output_path: Path, inventory: list
         raise ValueError("archive members changed")
     source_fields = {(note.note_id, index): value for note in source.notes for index, value in enumerate(note.fields)}
     output_fields = {(note.note_id, index): value for note in output.notes for index, value in enumerate(note.fields)}
+    expected_fields = dict(source_fields)
+    for entry in sorted(inventory, key=lambda item: int(item.get("occurrence", item["snippet_id"].rsplit("-", 1)[-1])), reverse=True):
+        if entry["classification"] == "convert":
+            key = (entry["note_id"], entry["field_index"])
+            expected_fields[key] = _replace_candidate(expected_fields[key], entry, entry["rust_replacement"])
+    if output_fields != expected_fields:
+        raise ValueError("note fields differ from approved replacements")
+    with zipfile.ZipFile(source_path) as original, zipfile.ZipFile(output_path) as rebuilt:
+        for member in source.members:
+            if member != "collection.anki2" and original.read(member) != rebuilt.read(member):
+                raise ValueError(f"non-database archive member changed: {member}")
     converted_keys = {(entry["note_id"], entry["field_index"]) for entry in inventory if entry["classification"] == "convert"}
     for entry in inventory:
         key = (entry["note_id"], entry["field_index"])

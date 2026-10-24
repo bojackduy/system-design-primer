@@ -119,6 +119,21 @@ class MediaResolutionTests(unittest.TestCase):
 
 
 class DeckLocalizationTests(unittest.TestCase):
+    def test_relocalizing_keeps_numeric_members_and_media_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "h81n9iK.png").write_bytes(b"png-data")
+            source, first, second = (root / name for name in ("source.apkg", "first.apkg", "second.apkg"))
+            self._create_fixture_deck(source)
+            localize_deck(source, assets, first)
+            localize_deck(first, assets, second)
+            with zipfile.ZipFile(first) as before, zipfile.ZipFile(second) as after:
+                self.assertEqual(before.namelist(), after.namelist())
+                self.assertEqual(before.read("media"), after.read("media"))
+                self.assertEqual(after.read("0"), b"png-data")
+
     def test_localizes_archive_and_preserves_unresolved_media(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -141,7 +156,7 @@ class DeckLocalizationTests(unittest.TestCase):
                     set(archive.namelist()),
                     {"collection.anki2", "media", "0", "extra.txt"},
                 )
-                self.assertEqual(json.loads(archive.read("media")), {"h81n9iK.png": "0"})
+                self.assertEqual(json.loads(archive.read("media")), {"0": "h81n9iK.png"})
                 self.assertEqual(archive.read("extra.txt"), b"preserve me")
                 database = root / "checked.anki2"
                 database.write_bytes(archive.read("collection.anki2"))
