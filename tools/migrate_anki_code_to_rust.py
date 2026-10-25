@@ -209,7 +209,7 @@ _RUST_TOKEN_STYLES = {
 
 def highlight_rust_html(source: str) -> str:
     """Render Rust source with inline colors, so Anki needs no external highlighter."""
-    parts: list[str] = ['<code class="language-rust" style="display:block;background-color:#1e1e1e;color:#d4d4d4;padding:12px;font-family:monospace;white-space:pre;overflow-x:auto;line-height:1.5;text-align:left">']
+    parts: list[str] = ['<code class="language-rust" style="display:block;background-color:#1e1e1e;color:#d4d4d4;padding:12px;font-family:monospace;white-space:pre-wrap;word-break:break-word;overflow-x:auto;line-height:1.5;text-align:left;border-radius:4px;">']
     cursor = 0
     for match in _RUST_TOKEN_RE.finditer(source):
         parts.append(html.escape(source[cursor:match.start()], quote=False))
