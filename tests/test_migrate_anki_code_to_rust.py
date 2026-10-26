@@ -11,6 +11,8 @@ from tools.migrate_anki_code_to_rust import (
     TS_AVAILABLE,
     apply_inventory_replacements,
     extract_code_candidates,
+    extract_codemirror_blocks,
+    extract_courier_blocks,
     extract_deck_notes,
     field_checksum,
     highlight_rust_html,
@@ -131,6 +133,41 @@ class MigrationExtractionTests(unittest.TestCase):
         text = html.unescape(re.sub(r"<[^>]+>", "", changed))
         self.assertIn('fn main() { println!("hi"); }', text.replace("wrap: on", ""))
 
+    def test_extracts_courier_blocks_groups_and_splits(self):
+        field = (
+            '<p class="p2">Hash Function</p>'
+            '<p class="p3">def f(x):</p><p class="p3">return x</p>'
+            '<p class="p3"><br></p>'
+            '<p class="p4">Complexity:</p>'
+        )
+        blocks = extract_courier_blocks(field)
+        self.assertEqual(len(blocks), 3)
+        self.assertIn("def f(x):", blocks[1][1])
+        self.assertTrue(blocks[1][0].startswith('<p class="p3">def f(x):</p>'))
+
+    def test_extracts_codemirror_blocks_strips_spans(self):
+        field = (
+            '<pre class=" CodeMirror-line "><span class="cm-keyword">class</span> A:</pre>'
+            '<pre class=" CodeMirror-line "><span>\u200b</span></pre>'
+            '<pre class=" CodeMirror-line ">    <span class="cm-def">f</span>():</pre>'
+        )
+        blocks = extract_codemirror_blocks(field)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][1], "class A:")
+        self.assertIn("f():", blocks[1][1])
+        self.assertNotIn("cm-keyword", blocks[1][0])
+
+    def test_exact_match_replacement(self):
+        field = '<p class="p3">def f(x):</p><p class="p3">return x</p><p>prose</p>'
+        entry = {"source_html": '<p class="p3">def f(x):</p><p class="p3">return x</p>',
+                 "snippet_id": "coding-1-1-courier-0", "occurrence": 0, "match": "exact"}
+        changed = _replace_candidate(field, entry, "fn f(x: i32) -> i32 { x }")
+        self.assertIn('class="language-rust"', changed)
+        self.assertIn('class="rust-wrap-toggle"', changed)
+        self.assertIn('<p>prose</p>', changed)
+        with self.assertRaisesRegex(ValueError, "source boundary"):
+            _replace_candidate("<p>other</p>", entry, "fn g() {}")
+
     def test_replacement_neutralizes_fixed_width_containers(self):
         field = '<div style="width: 928px"><pre><code>print(1)</code></pre></div>'
         entry = {"source_html": "<pre><code>print(1)</code></pre>", "snippet_id": "fixture-1-0-0"}
@@ -138,6 +175,36 @@ class MigrationExtractionTests(unittest.TestCase):
         self.assertNotIn("928px", changed)
         self.assertIn("max-width", changed)
         self.assertIn('class="language-rust"', changed)
+
+    def test_coding_inventory_assemblies_compile(self):
+        import shutil
+        import subprocess
+
+        if shutil.which("rustc") is None:
+            self.skipTest("rustc not available")
+        path = Path("docs/superpowers/rust-flashcard-code-inventory-coding.json")
+        if not path.exists():
+            self.skipTest("coding inventory absent")
+        inventory = json.loads(path.read_text(encoding="utf-8"))
+        groups: dict[tuple[int, int], list[str]] = {}
+        for entry in inventory:
+            if entry["classification"] != "convert":
+                continue
+            self.assertTrue(entry["rust_replacement"], entry["snippet_id"])
+            groups.setdefault((entry["note_id"], entry["field_index"]), []).append(entry["rust_replacement"])
+        self.assertTrue(groups, "no coding converts")
+        with tempfile.TemporaryDirectory() as directory:
+            for (note_id, field_index), parts in sorted(groups.items()):
+                source = Path(directory) / f"coding_{note_id}_{field_index}.rs"
+                source.write_text("\n\n".join(parts) + "\nfn main() {}\n", encoding="utf-8")
+                binary = Path(directory) / "t"
+                compiled = subprocess.run(
+                    ["rustc", "--edition=2021", "--test", str(source), "-o", str(binary)],
+                    capture_output=True, text=True, timeout=180,
+                )
+                self.assertEqual(compiled.returncode, 0, f"note {note_id} field {field_index}:\n{compiled.stderr}")
+                ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120)
+                self.assertEqual(ran.returncode, 0, f"note {note_id} field {field_index}:\n{ran.stdout}")
 
     def test_deck_width_pass_preserves_content(self):
         with tempfile.TemporaryDirectory() as directory:

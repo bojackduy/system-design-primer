@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -8,6 +10,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from tools.localize_anki_media import (
+    deck_asset_config,
     field_checksum,
     localize_deck,
     main,
@@ -154,7 +157,7 @@ class DeckLocalizationTests(unittest.TestCase):
             with zipfile.ZipFile(output) as archive:
                 self.assertEqual(
                     set(archive.namelist()),
-                    {"collection.anki2", "media", "0", "extra.txt"},
+                    {"collection.anki2", "media", "0", "extra.txt"}
                 )
                 self.assertEqual(json.loads(archive.read("media")), {"0": "h81n9iK.png"})
                 self.assertEqual(archive.read("extra.txt"), b"preserve me")
@@ -209,6 +212,74 @@ class DeckLocalizationTests(unittest.TestCase):
                 archive.write(database, "collection.anki2")
                 archive.writestr("media", "{}")
                 archive.writestr("extra.txt", "preserve me")
+
+
+def _file_fingerprint(path):
+    data = Path(path).read_bytes()
+    stat = os.stat(path)
+    return (hashlib.sha256(data).hexdigest(), stat.st_size, stat.st_mtime_ns)
+
+
+class CodingGifLocalizationTests(unittest.TestCase):
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    CODING_DECK = REPO_ROOT / "resources" / "flash_cards" / "Coding.apkg"
+    CODING_IMAGES = REPO_ROOT / "third_party" / "interactive-coding-challenges" / "images"
+    EXPECTED_GIFS = {
+        "dijkstra.gif",
+        "eratosthenes.gif",
+        "insertion_sort.gif",
+        "merge_sort.gif",
+        "quicksort_wikipedia.gif",
+        "selection_sort.gif",
+    }
+
+    def test_eratosthenes_alias_resolves_to_sieve_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory)
+            (assets / "sieve.gif").write_bytes(b"sieve-bytes")
+            self.assertEqual(
+                resolve_local_asset(
+                    "eratosthenes.gif", None, assets, {"eratosthenes.gif": "sieve.gif"}
+                ),
+                assets / "sieve.gif",
+            )
+            self.assertIsNone(resolve_local_asset("eratosthenes.gif", None, assets))
+
+    def test_coding_deck_asset_config(self):
+        asset_dir, aliases = deck_asset_config(self.CODING_DECK, Path("images"))
+        self.assertEqual(asset_dir, self.CODING_IMAGES)
+        self.assertEqual(aliases, {"eratosthenes.gif": "sieve.gif"})
+        asset_dir, aliases = deck_asset_config(
+            "resources/flash_cards/System Design.apkg", Path("images")
+        )
+        self.assertEqual(asset_dir, Path("images"))
+        self.assertEqual(aliases, {})
+
+    def test_coding_end_to_end_localizes_gifs_to_temp_only(self):
+        before = _file_fingerprint(self.CODING_DECK)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "Coding.localized.apkg"
+            asset_dir, aliases = deck_asset_config(self.CODING_DECK, Path("images"))
+            report = localize_deck(self.CODING_DECK, asset_dir, output, aliases=aliases)
+            self.assertEqual(set(report.localized_filenames), self.EXPECTED_GIFS)
+            self.assertEqual(report.unresolved_urls, [])
+            self.assertEqual(report.original_note_count, report.final_note_count)
+            with zipfile.ZipFile(self.CODING_DECK) as original:
+                original_members = {
+                    name: original.read(name)
+                    for name in original.namelist()
+                    if name not in {"collection.anki2", "media"}
+                }
+            with zipfile.ZipFile(output) as archive:
+                manifest = json.loads(archive.read("media"))
+                self.assertEqual(set(manifest.values()), self.EXPECTED_GIFS)
+                self.assertTrue(all(member.isdigit() for member in manifest))
+                for member, name in manifest.items():
+                    source = self.CODING_IMAGES / aliases.get(name, name)
+                    self.assertEqual(archive.read(member), source.read_bytes())
+                for name, data in original_members.items():
+                    self.assertEqual(archive.read(name), data)
+        self.assertEqual(_file_fingerprint(self.CODING_DECK), before)
 
 
 if __name__ == "__main__":

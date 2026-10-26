@@ -20,6 +20,127 @@ CODE_BLOCK_RE = re.compile(r"<pre\b[^>]*>(?P<body>.*?)</pre>", re.IGNORECASE | r
 INLINE_CODE_RE = re.compile(r"<code\b[^>]*>(?P<body>.*?)</code>", re.IGNORECASE | re.DOTALL)
 TAG_RE = re.compile(r"<[^>]+>")
 LANGUAGE_RE = re.compile(r"(?:language|lang|highlight)[-_]([a-zA-Z0-9+#-]+)", re.IGNORECASE)
+COURIER_P_RE = re.compile(r"<p\b[^>]*>(?P<body>.*?)</p>", re.IGNORECASE | re.DOTALL)
+CODEMIRROR_PRE_RE = re.compile(
+    r"<pre\b[^>]*\bCodeMirror-line\b[^>]*>(?P<body>.*?)</pre>", re.IGNORECASE | re.DOTALL
+)
+_BLANK_TEXT_RE = re.compile(r"^[\s\u200b\xa0]*$")
+
+
+def _is_courier_paragraph(match: re.Match[str]) -> bool:
+    opening = match.group(0)
+    opening = opening[: opening.find(">") + 1]
+    return (
+        "Courier" in opening
+        or 'class="p2"' in opening
+        or 'class="p3"' in opening
+        or 'class="p4"' in opening
+    )
+
+
+def _courier_text(body: str) -> str:
+    return html.unescape(TAG_RE.sub("", body)).strip().strip("\u200b").strip()
+
+
+def extract_courier_blocks(field: str) -> list[tuple[str, str]]:
+    """Group consecutive Courier <p> paragraphs into (source_html, source_text).
+
+    Blank paragraphs and non-Courier paragraphs end a block.
+    """
+    blocks: list[tuple[str, str]] = []
+    cur_spans: list[tuple[int, int]] = []
+    cur_text: list[str] = []
+
+    def flush() -> None:
+        if not cur_spans:
+            return
+        # Split leading prose / code core / trailing prose, then slice the
+        # exact field span (including inter-tag whitespace) per part.
+        idx = list(range(len(cur_text)))
+        codey = [bool(_CODE_LINE_RE.search(cur_text[k])) for k in idx]
+        if not any(codey):
+            parts = [idx]
+        else:
+            first = codey.index(True)
+            last = len(codey) - 1 - codey[::-1].index(True)
+            parts = []
+            if first > 0:
+                parts.append(idx[:first])
+            parts.append(idx[first:last + 1])
+            if last + 1 < len(cur_text):
+                parts.append(idx[last + 1:])
+        for part in parts:
+            start = cur_spans[part[0]][0]
+            end = cur_spans[part[-1]][1]
+            blocks.append((field[start:end], "\n".join(cur_text[k] for k in part)))
+        cur_spans.clear()
+        cur_text.clear()
+
+    for match in COURIER_P_RE.finditer(field):
+        if not _is_courier_paragraph(match):
+            flush()
+            continue
+        text = _courier_text(match.group("body"))
+        if text:
+            cur_spans.append(match.span(0))
+            cur_text.append(text)
+        else:
+            flush()
+    flush()
+    return blocks
+
+
+def extract_codemirror_blocks(field: str) -> list[tuple[str, str]]:
+    """Merge consecutive CodeMirror-line <pre> blocks, stripping cm-* spans."""
+    blocks: list[tuple[str, str]] = []
+    cur_spans: list[tuple[int, int]] = []
+    cur_text: list[str] = []
+    matches = list(CODEMIRROR_PRE_RE.finditer(field))
+
+    def flush() -> None:
+        if not cur_spans:
+            return
+        idx = list(range(len(cur_text)))
+        codey = [bool(_CODE_LINE_RE.search(cur_text[k])) for k in idx]
+        if not any(codey):
+            parts = [idx]
+        else:
+            first = codey.index(True)
+            last = len(codey) - 1 - codey[::-1].index(True)
+            parts = []
+            if first > 0:
+                parts.append(idx[:first])
+            parts.append(idx[first:last + 1])
+            if last + 1 < len(cur_text):
+                parts.append(idx[last + 1:])
+        for part in parts:
+            start = cur_spans[part[0]][0]
+            end = cur_spans[part[-1]][1]
+            blocks.append((field[start:end], "\n".join(cur_text[k] for k in part)))
+        cur_spans.clear()
+        cur_text.clear()
+
+    for index, match in enumerate(matches):
+        text = _courier_text(match.group("body"))
+        if text:
+            if cur_spans:
+                gap = field[matches[index - 1].end():match.start()]
+                # Notebook gutter line numbers are digits outside the <pre>;
+                # only real text between blocks ends a run.
+                gap_text = re.sub(r"[\d\s\u200b\xa0]", "", TAG_RE.sub("", html.unescape(gap)))
+                if gap_text:
+                    flush()
+            cur_spans.append(match.span(0))
+            cur_text.append(text)
+        else:
+            flush()
+    flush()
+    return blocks
+
+
+_CODE_LINE_RE = re.compile(
+    r"%%writefile\b|\b(def |class |import |return |for .+:|while .+:|if .+:|elif |else:|self\.|lambda |print\(|assert|raise |try:|except\b|==|!=|>=|<=|\w+\(.*\).*:|=)"
+)
 
 
 @dataclass(frozen=True)
@@ -153,6 +274,19 @@ def extract_code_candidates(snapshot: DeckSnapshot) -> list[CodeCandidate]:
     deck_name = snapshot.deck_path.stem.lower().replace(" ", "-")
     for note in snapshot.notes:
         for field_index, field in enumerate(note.fields):
+            cm_blocks = extract_codemirror_blocks(field)
+            if cm_blocks:
+                for occurrence, (source_html, source_text) in enumerate(cm_blocks):
+                    classification, notes = _classification("python", source_text)
+                    candidates.append(CodeCandidate(
+                        deck_path=str(snapshot.deck_path), note_id=note.note_id,
+                        field_index=field_index,
+                        snippet_id=f"{deck_name}-{note.note_id}-{field_index}-courier-{occurrence}",
+                        source_html=source_html, source_text=source_text,
+                        language="python", classification=classification,
+                        notes=notes or "CodeMirror solution block", occurrence=occurrence,
+                    ))
+                continue
             matches = list(CODE_BLOCK_RE.finditer(field))
             if not matches:
                 matches = list(INLINE_CODE_RE.finditer(field))
@@ -173,6 +307,19 @@ def extract_code_candidates(snapshot: DeckSnapshot) -> list[CodeCandidate]:
                     source_html=source_html, source_text=source_text,
                     language=language, classification=classification, notes=notes,
                     occurrence=occurrence, start=match.start(), end=match.end(),
+                ))
+            if matches:
+                continue
+            for occurrence, (source_html, source_text) in enumerate(extract_courier_blocks(field)):
+                language = _language(source_html)
+                classification, notes = _classification(language, source_text)
+                candidates.append(CodeCandidate(
+                    deck_path=str(snapshot.deck_path), note_id=note.note_id,
+                    field_index=field_index,
+                    snippet_id=f"{deck_name}-{note.note_id}-{field_index}-courier-{occurrence}",
+                    source_html=source_html, source_text=source_text,
+                    language=language, classification=classification, notes=notes,
+                    occurrence=occurrence,
                 ))
     return candidates
 
@@ -495,15 +642,23 @@ def _wrap_with_toggle(code_html: str) -> str:
 def _replace_candidate(field: str, candidate: dict, replacement: str) -> str:
     source_html = candidate["source_html"]
     occurrence = int(candidate.get("occurrence", int(candidate["snippet_id"].rsplit("-", 1)[-1])))
-    regions = list(CODE_BLOCK_RE.finditer(field)) or list(INLINE_CODE_RE.finditer(field))
-    if regions:
-        if occurrence < 0 or occurrence >= len(regions) or regions[occurrence].group(0) != source_html:
-            raise ValueError(f"source boundary mismatch for {candidate['snippet_id']}")
-        start, end = regions[occurrence].span()
-    elif occurrence == 0 and field == source_html:
-        start, end = 0, len(field)
+    if candidate.get("match") == "exact":
+        start = -1
+        for _ in range(occurrence + 1):
+            start = field.find(source_html, start + 1)
+            if start < 0:
+                raise ValueError(f"source boundary missing for {candidate['snippet_id']}")
+        end = start + len(source_html)
     else:
-        raise ValueError(f"source boundary missing for {candidate['snippet_id']}")
+        regions = list(CODE_BLOCK_RE.finditer(field)) or list(INLINE_CODE_RE.finditer(field))
+        if regions:
+            if occurrence < 0 or occurrence >= len(regions) or regions[occurrence].group(0) != source_html:
+                raise ValueError(f"source boundary mismatch for {candidate['snippet_id']}")
+            start, end = regions[occurrence].span()
+        elif occurrence == 0 and field == source_html:
+            start, end = 0, len(field)
+        else:
+            raise ValueError(f"source boundary missing for {candidate['snippet_id']}")
     highlighted = highlight_rust_html(replacement)
     if source_html.lower().startswith("<pre"):
         updated = re.sub(r"(?is)(<pre\b[^>]*>).*?(</pre>)", lambda match: "<pre" + _ensure_wrap_style(match.group(1)[4:-1]) + ">" + highlighted + match.group(2), source_html, count=1)
@@ -617,6 +772,8 @@ def validate_migrated_deck(source_path: Path, output_path: Path, inventory: list
             raise ValueError(f"excluded or manual snippet changed: {entry['snippet_id']}")
         if entry["classification"] == "convert" and entry["source_html"] in after:
             raise ValueError(f"source snippet remains: {entry['snippet_id']}")
+    source_full = {note.note_id: FIELD_SEPARATOR.join(note.fields) for note in source.notes}
+    source_csum = {note.note_id: note.checksum for note in source.notes}
     with zipfile.ZipFile(output_path) as archive:
         with tempfile.TemporaryDirectory() as directory:
             archive.extract("collection.anki2", directory)
@@ -626,7 +783,11 @@ def validate_migrated_deck(source_path: Path, output_path: Path, inventory: list
             for note_id, fields, checksum in connection.execute("SELECT id, flds, csum FROM notes"):
                 first_field = fields.split(FIELD_SEPARATOR)[0]
                 if int(checksum) != field_checksum(first_field):
-                    raise ValueError(f"checksum mismatch: {note_id}")
+                    # Untouched notes keep the deck's original checksum, which
+                    # may be based on a sort field that differs from field 0
+                    # (as in Coding.apkg). Only enforce the original value then.
+                    if fields != source_full[note_id] or int(checksum) != int(source_csum[note_id]):
+                        raise ValueError(f"checksum mismatch: {note_id}")
             connection.close()
 
 

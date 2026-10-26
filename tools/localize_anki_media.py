@@ -42,6 +42,40 @@ def field_checksum(first_field: str) -> int:
     return int(hashlib.sha1(first_field.encode("utf-8")).hexdigest()[:8], 16)
 
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True)
+class DeckAssetConfig:
+    """Per-deck media source override: asset dir plus referenced-name aliases."""
+
+    asset_dir: Path | None
+    aliases: dict[str, str]
+
+
+PER_DECK_ASSETS: dict[str, DeckAssetConfig] = {
+    # Coding.apkg notes reference algorithm gifs that live in the
+    # interactive-coding-challenges submodule, not in images/.
+    # eratosthenes.gif is referenced but no such file exists; sieve.gif
+    # depicts the same Sieve of Eratosthenes algorithm, so it is copied
+    # under the referenced name. Never rename files inside the submodule.
+    "Coding.apkg": DeckAssetConfig(
+        asset_dir=_REPO_ROOT / "third_party" / "interactive-coding-challenges" / "images",
+        aliases={"eratosthenes.gif": "sieve.gif"},
+    ),
+}
+
+
+def deck_asset_config(deck_path: Path | str, asset_dir: Path) -> tuple[Path, dict[str, str]]:
+    """Return (asset_dir, aliases) for a deck, applying PER_DECK_ASSETS."""
+    config = PER_DECK_ASSETS.get(Path(deck_path).name)
+    if config is None:
+        return asset_dir, {}
+    if config.asset_dir is not None:
+        return config.asset_dir, dict(config.aliases)
+    return asset_dir, dict(config.aliases)
+
+
 def _asset_name(url: str) -> str | None:
     parsed = urlparse(url)
     name = Path(parsed.path).name
@@ -61,15 +95,26 @@ def _canonical_origin(url: str) -> str:
         return url
 
 
-def resolve_local_asset(url: str, canonical_url: str | None, asset_dir: Path) -> Path | None:
-    """Resolve a media URL to an existing repository asset by filename."""
+def _referenced_name(url: str, canonical_url: str | None) -> str | None:
     candidate_url = html.unescape(canonical_url or "") if canonical_url else ""
     if not candidate_url:
         candidate_url = _canonical_origin(html.unescape(url))
-    name = _asset_name(candidate_url)
+    return _asset_name(candidate_url)
+
+
+def resolve_local_asset(
+    url: str, canonical_url: str | None, asset_dir: Path, aliases: dict[str, str] | None = None
+) -> Path | None:
+    """Resolve a media URL to an existing repository asset by filename.
+
+    With aliases, the returned file may live under a different on-disk name
+    than the referenced one; use _referenced_name for the display name.
+    """
+    name = _referenced_name(url, canonical_url)
     if not name:
         return None
-    asset = asset_dir / name
+    source = (aliases or {}).get(name, name)
+    asset = asset_dir / source
     return asset if asset.is_file() else None
 
 
@@ -99,16 +144,20 @@ def rewrite_media_html(
     return _MEDIA_TAG.sub(replace, html_text), unresolved
 
 
-def _rewrite_field(field: str, asset_dir: Path, filenames: set[str]) -> tuple[str, list[str]]:
-    return rewrite_media_html(
-        field,
-        lambda url, canonical: (
-            resolve_local_asset(url, canonical, asset_dir).name
-            if resolve_local_asset(url, canonical, asset_dir)
-            else None
-        ),
-        filenames.add,
-    )
+def _rewrite_field(
+    field: str, asset_dir: Path, filenames: set[str], aliases: dict[str, str] | None = None
+) -> tuple[str, list[str]]:
+    aliases = aliases or {}
+
+    def resolver(url: str, canonical: str | None) -> str | None:
+        name = _referenced_name(url, canonical)
+        if name is None:
+            return None
+        if resolve_local_asset(url, canonical, asset_dir, aliases) is None:
+            return None
+        return name
+
+    return rewrite_media_html(field, resolver, filenames.add)
 
 
 def _normalize_media_manifest(raw_manifest: dict[str, str]) -> dict[str, str]:
@@ -132,7 +181,9 @@ def _extract_archive(archive: zipfile.ZipFile, destination: Path) -> list[str]:
     return [member.filename for member in members]
 
 
-def localize_deck(deck_path: Path, asset_dir: Path, output_path: Path) -> LocalizationReport:
+def localize_deck(
+    deck_path: Path, asset_dir: Path, output_path: Path, aliases: dict[str, str] | None = None
+) -> LocalizationReport:
     """Create a localized copy of one Anki package."""
     localized: set[str] = set()
     unresolved: list[str] = []
@@ -152,7 +203,7 @@ def localize_deck(deck_path: Path, asset_dir: Path, output_path: Path) -> Locali
             rewritten_values = []
             changed = False
             for field in field_values:
-                rewritten, missing = _rewrite_field(field, asset_dir, localized)
+                rewritten, missing = _rewrite_field(field, asset_dir, localized, aliases)
                 rewritten_values.append(rewritten)
                 unresolved.extend(missing)
                 changed |= rewritten != field
@@ -180,7 +231,8 @@ def localize_deck(deck_path: Path, asset_dir: Path, output_path: Path) -> Locali
                 media_manifest[member] = name
                 member_by_name[name] = member
                 next_media_id += 1
-            shutil.copy2(asset_dir / name, extracted / name)
+            source_name = (aliases or {}).get(name, name)
+            shutil.copy2(asset_dir / source_name, extracted / name)
         media_path = extracted / "media"
         media_path.write_text(json.dumps(media_manifest, separators=(",", ":")), encoding="utf-8")
 
@@ -243,7 +295,8 @@ def main() -> int:
         output = deck if args.in_place else args.output
         if output == deck and not args.in_place:
             raise SystemExit("refusing to overwrite input deck without --in-place")
-        report = localize_deck(deck, args.assets, output)
+        deck_assets, deck_aliases = deck_asset_config(deck, args.assets)
+        report = localize_deck(deck, deck_assets, output, aliases=deck_aliases)
         print(f"{deck}: localized {len(report.localized_filenames)} media files")
         for url in sorted(set(report.unresolved_urls)):
             print(f"unresolved: {url}")
