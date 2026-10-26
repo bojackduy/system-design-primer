@@ -194,9 +194,15 @@ def load_inventory(path: Path) -> list[dict]:
 
 
 _RUST_TOKEN_RE = re.compile(
-    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"|"
-    r"\b(?:fn|let|mut|struct|enum|trait|impl|use|pub|mod|match|if|else|for|while|loop|return|self|Self|true|false|Some|None|Result|Option|String|usize|u8|u64)\b|"
-    r"\b\d+\b",
+    r"(?P<comment>//[^\n]*|/\*.*?\*/)"
+    r"|(?P<string>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+    r"|(?P<attribute>#\[[^\]]*\])"
+    r"|(?P<lifetime>'[a-z_][a-z0-9_]*|'_)"
+    r"|(?P<macro>\b[a-z_][a-z0-9_]*!)"
+    r"|(?P<keyword>\b(?:fn|let|mut|struct|enum|trait|impl|use|pub|mod|match|if|else|for|while|loop|return|self|Self|true|false|Some|None|Ok|Err|as|ref|move|where|type|const|static|crate|in|dyn|async|await)\b)"
+    r"|(?P<type>\b(?:[A-Z][A-Za-z0-9_]*|u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize|f32|f64|bool|char|str|String|Vec|Option|Result|Box|Rc|Arc|Self)\b)"
+    r"|(?P<number>\b\d[\w\.]*\b)"
+    r"|(?P<function>\b[a-z_][a-z0-9_]*(?=\s*\())",
     re.DOTALL,
 )
 _RUST_TOKEN_STYLES = {
@@ -204,29 +210,55 @@ _RUST_TOKEN_STYLES = {
     "rust-string": "#ce9178",
     "rust-comment": "#6a9955",
     "rust-number": "#b5cea8",
+    "rust-type": "#4ec9b0",
+    "rust-function": "#dcdcaa",
+    "rust-macro": "#dcdcaa",
+    "rust-lifetime": "#569cd6",
+    "rust-attribute": "#9cdcfe",
 }
 
 
 def highlight_rust_html(source: str) -> str:
     """Render Rust source with inline colors, so Anki needs no external highlighter."""
-    parts: list[str] = ['<code class="language-rust" style="display:block;background-color:#1e1e1e;color:#d4d4d4;padding:12px;font-family:monospace;white-space:pre-wrap;word-break:break-word;overflow-x:auto;line-height:1.5;text-align:left;border-radius:4px;">']
+    parts: list[str] = ['<code class="language-rust" style="display:block;box-sizing:border-box;max-width:100%;background-color:#1e1e1e;color:#d4d4d4;padding:12px;font-family:monospace;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;line-height:1.5;text-align:left;border-radius:4px;">']
     cursor = 0
     for match in _RUST_TOKEN_RE.finditer(source):
         parts.append(html.escape(source[cursor:match.start()], quote=False))
         token = match.group(0)
-        if token.startswith("//") or token.startswith("/*"):
-            kind = "rust-comment"
-        elif token.startswith('"'):
-            kind = "rust-string"
-        elif token.isdigit():
-            kind = "rust-number"
-        else:
-            kind = "rust-keyword"
+        kind = f"rust-{match.lastgroup}"
         parts.append(f'<span class="{kind}" style="color:{_RUST_TOKEN_STYLES[kind]}">{html.escape(token, quote=False)}</span>')
         cursor = match.end()
     parts.append(html.escape(source[cursor:], quote=False))
     parts.append("</code>")
     return "".join(parts)
+
+
+def _neutralize_fixed_width_containers(field: str) -> str:
+    """Remove desktop-only fixed widths inherited from notebook HTML.
+
+    Field-wide pass touches only ancestor container widths (e.g. the 928px
+    notebook div), never <pre> tags: excluded/manual snippets share fields
+    with converted blocks and their source HTML must stay byte-identical.
+    """
+    return re.sub(r"(?<![-\w])width\s*:\s*928px", "max-width: 100%", field)
+
+
+def _ensure_wrap_style(attrs: str) -> str:
+    style_match = re.search(r'''(?is)\bstyle\s*=\s*(["'])(.*?)\1''', attrs)
+    wrap = "max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;"
+    if not style_match:
+        return f'{attrs} style="{wrap}"'
+    quote, style = style_match.group(1), style_match.group(2)
+    if "max-width" not in style:
+        style += "max-width:100%;"
+    if "pre-wrap" not in style:
+        style += "white-space:pre-wrap;"
+    if "overflow-wrap" not in style:
+        style += "overflow-wrap:anywhere;"
+    if "word-break" not in style:
+        style += "word-break:break-word;"
+    start, end = style_match.span(2)
+    return attrs[:start] + style + attrs[end:]
 
 
 def _replace_candidate(field: str, candidate: dict, replacement: str) -> str:
@@ -243,10 +275,10 @@ def _replace_candidate(field: str, candidate: dict, replacement: str) -> str:
         raise ValueError(f"source boundary missing for {candidate['snippet_id']}")
     highlighted = highlight_rust_html(replacement)
     if source_html.lower().startswith("<pre"):
-        updated = re.sub(r"(?is)(<pre\b[^>]*>).*?(</pre>)", lambda match: match.group(1) + highlighted + match.group(2), source_html, count=1)
+        updated = re.sub(r"(?is)(<pre\b[^>]*>).*?(</pre>)", lambda match: "<pre" + _ensure_wrap_style(match.group(1)[4:-1]) + ">" + highlighted + match.group(2), source_html, count=1)
     else:
         updated = highlighted
-    return field[:start] + updated + field[end:]
+    return _neutralize_fixed_width_containers(field[:start] + updated + field[end:])
 
 
 def apply_inventory_replacements(deck_path: Path, inventory: list[dict], output_path: Path) -> None:
@@ -282,6 +314,35 @@ def apply_inventory_replacements(deck_path: Path, inventory: list[dict], output_
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def neutralize_deck_container_widths(deck_path: Path) -> int:
+    """Replace desktop-only 928px container widths in every field.
+
+    Content-preserving layout fix: only the width declaration changes, so
+    notebook-derived cards fit narrow phone screens. Returns touched fields.
+    """
+    temp_dir, _, _ = _read_archive(deck_path)
+    try:
+        database = temp_dir / "collection.anki2"
+        connection = sqlite3.connect(database)
+        touched = 0
+        for note_id, fields_value in connection.execute("SELECT id, flds FROM notes ORDER BY id"):
+            fields = fields_value.split(FIELD_SEPARATOR)
+            normalized = [_neutralize_fixed_width_containers(field) for field in fields]
+            if normalized != fields:
+                touched += sum(1 for before, after in zip(fields, normalized) if before != after)
+                new_fields = FIELD_SEPARATOR.join(normalized)
+                connection.execute("UPDATE notes SET flds = ?, sfld = ?, csum = ? WHERE id = ?", (new_fields, normalized[0], field_checksum(normalized[0]), note_id))
+        connection.commit()
+        connection.close()
+        with zipfile.ZipFile(deck_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for source in sorted(temp_dir.rglob("*")):
+                if source.is_file():
+                    archive.write(source, source.relative_to(temp_dir).as_posix())
+        return touched
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def validate_inventory(inventory: list[dict]) -> None:
     ids = [entry["snippet_id"] for entry in inventory]
     if len(ids) != len(set(ids)):
@@ -306,6 +367,8 @@ def validate_migrated_deck(source_path: Path, output_path: Path, inventory: list
         if entry["classification"] == "convert":
             key = (entry["note_id"], entry["field_index"])
             expected_fields[key] = _replace_candidate(expected_fields[key], entry, entry["rust_replacement"])
+    for key, value in expected_fields.items():
+        expected_fields[key] = _neutralize_fixed_width_containers(value)
     if output_fields != expected_fields:
         raise ValueError("note fields differ from approved replacements")
     with zipfile.ZipFile(source_path) as original, zipfile.ZipFile(output_path) as rebuilt:
@@ -317,7 +380,7 @@ def validate_migrated_deck(source_path: Path, output_path: Path, inventory: list
         key = (entry["note_id"], entry["field_index"])
         before = source_fields[key]
         after = output_fields[key]
-        if entry["classification"] != "convert" and key not in converted_keys and before != after:
+        if entry["classification"] != "convert" and key not in converted_keys and after != _neutralize_fixed_width_containers(before):
             raise ValueError(f"out-of-scope field changed: {entry['snippet_id']}")
         if entry["classification"] != "convert" and entry["source_html"] not in after:
             raise ValueError(f"excluded or manual snippet changed: {entry['snippet_id']}")

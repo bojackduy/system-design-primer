@@ -13,6 +13,7 @@ from tools.migrate_anki_code_to_rust import (
     extract_deck_notes,
     field_checksum,
     highlight_rust_html,
+    neutralize_deck_container_widths,
     _replace_candidate,
     validate_migrated_deck,
     write_inventory,
@@ -81,6 +82,48 @@ class MigrationExtractionTests(unittest.TestCase):
         self.assertIn('class="rust-keyword"', highlighted)
         self.assertIn('class="rust-string"', highlighted)
         self.assertIn('class="rust-comment"', highlighted)
+        self.assertIn("overflow-wrap:anywhere", highlighted)
+        self.assertIn("word-break:break-word", highlighted)
+        self.assertIn("max-width:100%", highlighted)
+        self.assertNotIn("overflow-x:auto", highlighted)
+
+    def test_highlights_rust_token_kinds(self):
+        source = "#[derive(Debug)]\nfn get(&'a self) -> Vec<u32> { self.items(len + 0x1F) }\nprintln!(\"v\"); // done\n"
+        highlighted = highlight_rust_html(source)
+        for kind in ("rust-attribute", "rust-lifetime", "rust-type", "rust-function", "rust-macro", "rust-number"):
+            self.assertIn(f'class="{kind}"', highlighted)
+        self.assertEqual(html.unescape(re.sub(r"<[^>]+>", "", highlighted)), source)
+
+    def test_replacement_neutralizes_fixed_width_containers(self):
+        field = '<div style="width: 928px"><pre><code>print(1)</code></pre></div>'
+        entry = {"source_html": "<pre><code>print(1)</code></pre>", "snippet_id": "fixture-1-0-0"}
+        changed = _replace_candidate(field, entry, 'fn main() { println!("hi"); }')
+        self.assertNotIn("928px", changed)
+        self.assertIn("max-width", changed)
+        self.assertIn('class="language-rust"', changed)
+
+    def test_deck_width_pass_preserves_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deck = self.make_deck(root)
+            database = root / "collection.anki2"
+            connection = sqlite3.connect(database)
+            fields = connection.execute("SELECT flds FROM notes WHERE id = 1").fetchone()[0]
+            wrapped = f'<div style="width: 928px">{fields}</div>'
+            connection.execute("UPDATE notes SET flds = ?, sfld = ?, csum = ? WHERE id = 1", (wrapped, wrapped.split("\x1f")[0], field_checksum(wrapped.split("\x1f")[0])))
+            connection.commit()
+            connection.close()
+            with zipfile.ZipFile(deck, "w") as archive:
+                archive.write(database, "collection.anki2")
+                archive.writestr("media", "{}")
+                archive.writestr("local.png", b"image")
+            touched = neutralize_deck_container_widths(deck)
+            self.assertGreater(touched, 0)
+            changed = extract_deck_notes(deck).notes[0].fields[0]
+            self.assertNotIn("928px", changed)
+            self.assertIn('href="https://example.com"', changed)
+            self.assertIn('src="local.png"', changed)
+            self.assertIn("print(", html.unescape(re.sub(r"<[^>]+>", "", changed)))
 
     def test_extracts_code_candidates_and_preserves_boundaries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -131,8 +174,8 @@ class MigrationExtractionTests(unittest.TestCase):
             apply_inventory_replacements(rebuilt, entries, output)
             changed = extract_deck_notes(output).notes[0].fields[0]
             self.assertIn('class="language-rust"', changed)
-            self.assertIn("main()", changed)
-            self.assertIn("bye()", changed)
+            self.assertIn(">main<", changed)
+            self.assertIn(">bye<", changed)
 
     def test_applies_only_approved_code_and_validates_archive(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -153,7 +196,7 @@ class MigrationExtractionTests(unittest.TestCase):
             validate_migrated_deck(source, output, [entry])
             changed = extract_deck_notes(output).notes[0].fields[0]
             self.assertIn('class="language-rust"', changed)
-            self.assertIn('main()', changed)
+            self.assertIn('>main<', changed)
             self.assertIn('href="https://example.com"', changed)
             self.assertIn('src="local.png"', changed)
 
@@ -170,7 +213,7 @@ class MigrationExtractionTests(unittest.TestCase):
             database = root / "corrupted.anki2"
             database.write_bytes(members["collection.anki2"])
             connection = sqlite3.connect(database)
-            fields = connection.execute("SELECT flds FROM notes").fetchone()[0].replace("main()", "wrong()")
+            fields = connection.execute("SELECT flds FROM notes").fetchone()[0].replace(">main<", ">wrong<")
             connection.execute("UPDATE notes SET flds = ?, csum = ?", (fields, field_checksum(fields.split("\x1f")[0])))
             connection.commit()
             connection.close()
