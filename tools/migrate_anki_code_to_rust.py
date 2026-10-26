@@ -217,10 +217,205 @@ _RUST_TOKEN_STYLES = {
     "rust-attribute": "#9cdcfe",
 }
 
+try:
+    from tree_sitter import Language as _TsLanguage
+    from tree_sitter import Parser as _TsParser
+    import tree_sitter_rust as _ts_rust_grammar
 
-def highlight_rust_html(source: str) -> str:
-    """Render Rust source with inline colors, so Anki needs no external highlighter."""
-    parts: list[str] = ['<code class="language-rust" style="display:block;box-sizing:border-box;max-width:100%;background-color:#1e1e1e;color:#d4d4d4;padding:12px;font-family:monospace;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;line-height:1.5;text-align:left;border-radius:4px;">']
+    _TS_LANGUAGE = _TsLanguage(_ts_rust_grammar.language())
+    _TS_PARSER = _TsParser(_TS_LANGUAGE)
+    TS_AVAILABLE = True
+except ImportError:
+    TS_AVAILABLE = False
+
+# Catppuccin Mocha palette for Rust tokens.
+_CATPPUCCIN_MOCHA = {
+    "rust-keyword": "#cba6f7",
+    "rust-string": "#a6e3a1",
+    "rust-comment": "#7f849c",
+    "rust-number": "#fab387",
+    "rust-type": "#f9e2af",
+    "rust-function": "#89b4fa",
+    "rust-macro": "#94e2d5",
+    "rust-lifetime": "#74c7ec",
+    "rust-attribute": "#b4befe",
+    "rust-property": "#b4befe",
+    "rust-operator": "#89dceb",
+    "rust-escape": "#f5c2e7",
+    "rust-builtin": "#f38ba8",
+    "rust-constant": "#fab387",
+    "base": "#1e1e2e",
+    "text": "#cdd6f4",
+}
+
+_TS_KEYWORDS = frozenset(
+    "fn let mut struct enum trait impl use pub mod match if else for while loop "
+    "return as ref move where type const static crate in dyn async await".split()
+)
+_TS_OPERATORS = frozenset(
+    ["=", "==", "!=", "<", ">", "<=", ">=", "+", "-", "*", "/", "%", "&&", "||",
+     "!", "->", "=>", "::", ".", "..", "..=", "&", "|", "^", "<<", ">>", "?"]
+)
+_TS_PRIMITIVES = frozenset(
+    "u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f32 f64 bool char str".split()
+)
+
+
+def _ts_span(kind: str, text: str) -> str:
+    return f'<span class="{kind}" style="color:{_CATPPUCCIN_MOCHA[kind]}">{html.escape(text, quote=False)}</span>'
+
+
+def _ts_leaf_class(node_type: str, text: str, parent_type: str, field: str | None) -> str | None:
+    if node_type in ("integer_literal", "float_literal", "boolean_literal"):
+        return "rust-number"
+    if node_type == "char_literal":
+        return "rust-string"
+    if node_type == "identifier":
+        if parent_type == "macro_invocation" and field == "macro":
+            return "rust-macro"
+        if parent_type == "function_item" and field == "name":
+            return "rust-function"
+        if parent_type == "attribute":
+            return "rust-attribute"
+        if text in _TS_PRIMITIVES:
+            return "rust-type"
+        if len(text) > 1 and text.isupper() and text.replace("_", "").isalnum():
+            return "rust-constant"
+        if text[:1].isupper():
+            return "rust-type"
+        return None
+    if node_type in ("type_identifier", "primitive_type"):
+        return "rust-type"
+    if node_type == "field_identifier":
+        return "rust-property"
+    if node_type in ("self", "super", "crate"):
+        return "rust-builtin"
+    if node_type == "escape_sequence":
+        return "rust-escape"
+    if node_type in _TS_KEYWORDS:
+        return "rust-keyword"
+    if node_type in _TS_OPERATORS:
+        return "rust-operator"
+    return None
+
+
+def _ts_children(node):
+    for index, child in enumerate(node.children):
+        try:
+            field = node.field_name_for_child(index)
+        except Exception:
+            field = None
+        yield child, field
+
+
+def _ts_emit(node, source: str, out: list[str], parent_type: str = "", field: str | None = None, func_path: bool = False) -> None:
+    node_type = node.type
+    text = source[node.start_byte:node.end_byte]
+    if node.child_count == 0:
+        if node_type == "!" and parent_type == "macro_invocation":
+            out.append(_ts_span("rust-macro", text))
+            return
+        kind = _ts_leaf_class(node_type, text, parent_type, field)
+        if kind == "rust-property" and func_path:
+            kind = "rust-function"
+        out.append(_ts_span(kind, text) if kind else html.escape(text, quote=False))
+        return
+    if node_type in ("line_comment", "block_comment"):
+        out.append(_ts_span("rust-comment", text))
+        return
+    if node_type in ("integer_literal", "float_literal", "boolean_literal"):
+        out.append(_ts_span("rust-number", text))
+        return
+    if node_type == "lifetime":
+        out.append(_ts_span("rust-lifetime", text))
+        return
+    if node_type in ("char_literal", "raw_string_literal"):
+        out.append(_ts_span("rust-string", text))
+        return
+    if node_type == "string_literal":
+        def render_string(child, _field):
+            child_text = source[child.start_byte:child.end_byte]
+            if child.type == "escape_sequence":
+                out.append(_ts_span("rust-escape", child_text))
+            elif child.child_count == 0:
+                out.append(_ts_span("rust-string", child_text))
+            else:
+                _ts_emit(child, source, out, node_type, None)
+        _ts_emit_children(node, source, out, render_string)
+        return
+    if node_type == "attribute_item":
+        def render_attr_item(child, _field):
+            if child.child_count == 0:
+                out.append(_ts_span("rust-attribute", source[child.start_byte:child.end_byte]))
+            else:
+                _ts_emit(child, source, out, node_type, None)
+        _ts_emit_children(node, source, out, render_attr_item)
+        return
+    if node_type == "macro_invocation":
+        def render_macro(child, child_field):
+            _ts_emit(child, source, out, node_type, child_field)
+        _ts_emit_children(node, source, out, render_macro)
+        return
+    if node_type == "call_expression":
+        def render_call(child, child_field):
+            _ts_emit(child, source, out, node_type, child_field, func_path=(child_field == "function"))
+        _ts_emit_children(node, source, out, render_call)
+        return
+    if node_type == "field_expression":
+        def render_field(child, child_field):
+            if child_field == "field":
+                _ts_emit(child, source, out, node_type, child_field, func_path=func_path)
+            else:
+                _ts_emit(child, source, out, node_type, child_field)
+        _ts_emit_children(node, source, out, render_field)
+        return
+    if node_type == "scoped_identifier":
+        def render_scoped(child, child_field):
+            if child_field == "name" and func_path and child.type == "identifier":
+                out.append(_ts_span("rust-function", source[child.start_byte:child.end_byte]))
+            else:
+                _ts_emit(child, source, out, node_type, child_field, func_path=func_path)
+        _ts_emit_children(node, source, out, render_scoped)
+        return
+    def render_default(child, child_field):
+        _ts_emit(child, source, out, node_type, child_field)
+    _ts_emit_children(node, source, out, render_default)
+
+
+def _ts_emit_children(node, source: str, out: list[str], render) -> None:
+    """Emit children, preserving skipped whitespace between siblings."""
+    cursor = node.start_byte
+    for child, child_field in _ts_children(node):
+        if child.start_byte > cursor:
+            out.append(html.escape(source[cursor:child.start_byte], quote=False))
+        render(child, child_field)
+        cursor = child.end_byte
+    if cursor < node.end_byte:
+        out.append(html.escape(source[cursor:node.end_byte], quote=False))
+
+
+def _highlight_treesitter(source: str) -> str:
+    """Render Rust source with Tree-sitter tokens in Catppuccin Mocha."""
+    tree = _TS_PARSER.parse(source.encode("utf-8"))
+    out: list[str] = [_code_open_tag()]
+    _ts_emit(tree.root_node, source, out)
+    out.append("</code>")
+    return "".join(out)
+
+
+def _code_open_tag() -> str:
+    base = _CATPPUCCIN_MOCHA["base"]
+    text = _CATPPUCCIN_MOCHA["text"]
+    return (
+        '<code class="language-rust" style="display:block;box-sizing:border-box;max-width:100%;'
+        f"background-color:{base};color:{text};padding:12px;font-family:monospace;white-space:pre-wrap;"
+        'overflow-wrap:anywhere;word-break:break-word;line-height:1.5;text-align:left;border-radius:4px;">'
+    )
+
+
+def _highlight_regex(source: str) -> str:
+    """Fallback highlighter when Tree-sitter is unavailable."""
+    parts: list[str] = [_code_open_tag()]
     cursor = 0
     for match in _RUST_TOKEN_RE.finditer(source):
         parts.append(html.escape(source[cursor:match.start()], quote=False))
@@ -231,6 +426,17 @@ def highlight_rust_html(source: str) -> str:
     parts.append(html.escape(source[cursor:], quote=False))
     parts.append("</code>")
     return "".join(parts)
+
+
+def highlight_rust_html(source: str) -> str:
+    """Render Rust source with inline colors, so Anki needs no external highlighter.
+
+    Prefers Tree-sitter (Catppuccin Mocha); falls back to regex colors when
+    Tree-sitter is not installed.
+    """
+    if TS_AVAILABLE:
+        return _highlight_treesitter(source)
+    return _highlight_regex(source)
 
 
 def _neutralize_fixed_width_containers(field: str) -> str:

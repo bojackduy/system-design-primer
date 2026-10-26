@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 
 from tools.migrate_anki_code_to_rust import (
+    TS_AVAILABLE,
     apply_inventory_replacements,
     extract_code_candidates,
     extract_deck_notes,
@@ -40,8 +41,31 @@ class MigrationExtractionTests(unittest.TestCase):
             source = entry["rust_replacement"]
             rendered = highlight_rust_html(source)
             self.assertEqual(html.unescape(re.sub(r"<[^>]+>", "", rendered)), source)
-            self.assertIn("background-color:#1e1e1e", rendered)
+            self.assertIn("background-color:#1e1e2e", rendered)
             self.assertIn('class="rust-keyword"', rendered)
+
+    @unittest.skipUnless(TS_AVAILABLE, "tree-sitter not installed")
+    def test_treesitter_renders_catppuccin_mocha(self):
+        source = (
+            "#[derive(Debug)]\n"
+            "const MAX: u32 = u32::MAX; // set limit\n"
+            "fn get(&'a self, path: &'x str) -> Vec<u32> {\n"
+            "    let ch = 'a'; let s = \"hi\\n\";\n"
+            "    self.items(len + 0x1F) + self.limit\n"
+            "}\n"
+            "println!(\"v={}\", v);\n"
+        )
+        rendered = highlight_rust_html(source)
+        self.assertEqual(html.unescape(re.sub(r"<[^>]+>", "", rendered)), source)
+        for kind in ("rust-keyword", "rust-string", "rust-comment", "rust-number",
+                     "rust-type", "rust-function", "rust-macro", "rust-lifetime",
+                     "rust-attribute", "rust-property", "rust-operator",
+                     "rust-escape", "rust-builtin", "rust-constant"):
+            self.assertIn(f'class="{kind}"', rendered)
+        for mocha in ("#cba6f7", "#a6e3a1", "#7f849c", "#fab387", "#f9e2af",
+                      "#89b4fa", "#94e2d5", "#74c7ec", "#b4befe", "#89dceb",
+                      "#f5c2e7", "#f38ba8", "#1e1e2e", "#cdd6f4"):
+            self.assertIn(mocha, rendered)
 
     def make_deck(self, root: Path) -> Path:
         database = root / "collection.anki2"
