@@ -118,6 +118,19 @@ class MigrationExtractionTests(unittest.TestCase):
             self.assertIn(f'class="{kind}"', highlighted)
         self.assertEqual(html.unescape(re.sub(r"<[^>]+>", "", highlighted)), source)
 
+    def test_replacement_adds_wrap_toggle_button(self):
+        field = '<pre><code>print(1)</code></pre>'
+        entry = {"source_html": field, "snippet_id": "fixture-1-0-0"}
+        changed = _replace_candidate(field, entry, 'fn main() { println!("hi"); }')
+        self.assertIn('class="rust-wrap-toggle"', changed)
+        self.assertIn('onclick="', changed)
+        self.assertIn("whiteSpace='pre'", changed)
+        self.assertIn("whiteSpace='pre-wrap'", changed)
+        self.assertIn(">wrap: on<", changed)
+        self.assertIn('class="rust-snippet"', changed)
+        text = html.unescape(re.sub(r"<[^>]+>", "", changed))
+        self.assertIn('fn main() { println!("hi"); }', text.replace("wrap: on", ""))
+
     def test_replacement_neutralizes_fixed_width_containers(self):
         field = '<div style="width: 928px"><pre><code>print(1)</code></pre></div>'
         entry = {"source_html": "<pre><code>print(1)</code></pre>", "snippet_id": "fixture-1-0-0"}

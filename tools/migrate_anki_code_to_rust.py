@@ -467,6 +467,31 @@ def _ensure_wrap_style(attrs: str) -> str:
     return attrs[:start] + style + attrs[end:]
 
 
+_WRAP_TOGGLE_SCRIPT = (
+    "var c=this.parentNode.parentNode.querySelector('code');"
+    "var on=c.style.whiteSpace!=='pre';"
+    "if(on){c.style.whiteSpace='pre';c.style.overflowX='auto';this.textContent='wrap: off';}"
+    "else{c.style.whiteSpace='pre-wrap';c.style.overflowX='visible';this.textContent='wrap: on';}"
+)
+
+
+def _wrap_with_toggle(code_html: str) -> str:
+    """Prepend a tap-to-toggle wrap button above a highlighted code block.
+
+    Inline onclick works in Anki desktop and AnkiDroid reviewers with no
+    card-template changes. Default state is wrap-on for narrow screens.
+    """
+    return (
+        '<div class="rust-snippet" style="max-width:100%">'
+        '<div style="max-width:100%;text-align:right">'
+        '<button class="rust-wrap-toggle" style="font-size:12px;padding:2px 10px;margin:0 0 4px 0;'
+        "background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4px;font-family:sans-serif;\""
+        f' onclick="{_WRAP_TOGGLE_SCRIPT}">wrap: on</button></div>'
+        + code_html
+        + "</div>"
+    )
+
+
 def _replace_candidate(field: str, candidate: dict, replacement: str) -> str:
     source_html = candidate["source_html"]
     occurrence = int(candidate.get("occurrence", int(candidate["snippet_id"].rsplit("-", 1)[-1])))
@@ -484,7 +509,7 @@ def _replace_candidate(field: str, candidate: dict, replacement: str) -> str:
         updated = re.sub(r"(?is)(<pre\b[^>]*>).*?(</pre>)", lambda match: "<pre" + _ensure_wrap_style(match.group(1)[4:-1]) + ">" + highlighted + match.group(2), source_html, count=1)
     else:
         updated = highlighted
-    return _neutralize_fixed_width_containers(field[:start] + updated + field[end:])
+    return _neutralize_fixed_width_containers(field[:start] + _wrap_with_toggle(updated) + field[end:])
 
 
 def apply_inventory_replacements(deck_path: Path, inventory: list[dict], output_path: Path) -> None:
