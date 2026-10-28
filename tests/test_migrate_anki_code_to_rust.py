@@ -23,6 +23,49 @@ from tools.migrate_anki_code_to_rust import (
 )
 
 
+_STRUCT_PREFIXES = ('pub ', 'fn ', 'struct ', 'enum ', 'impl ', 'impl<', 'use ',
+                    'const ', 'static ', 'trait ', 'mod ', '#[', 'extern ',
+                    'unsafe ', '/*', '* ', '};')
+
+
+def _is_structural_part(part):
+    for line in part.split('\n'):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('//'):
+            continue
+        return stripped.startswith(_STRUCT_PREFIXES) or stripped.startswith('}')
+    return True
+
+
+def _brace_delta(text):
+    depth = 0
+    for line in text.split('\n'):
+        code = line.split('//')[0]
+        code = re.sub(r'"[^"]*"', '""', code)
+        code = re.sub(r"'[^']*'", "''", code)
+        depth += code.count('{') - code.count('}')
+    return depth
+
+
+def assemble_note_parts(parts):
+    """Join Rust replacements for compilation.
+
+    Display-only fragments (bare statements like `queue.enqueue(1);`) are
+    valid card snippets but not top-level items. Keep them only inside an
+    already-open item; otherwise skip them for compilation.
+    """
+    kept = []
+    depth = 0
+    for part in parts:
+        if _is_structural_part(part):
+            kept.append(part)
+            depth += _brace_delta(part)
+        elif depth > 0:
+            kept.append(part)
+            depth += _brace_delta(part)
+    return kept
+
+
 class MigrationExtractionTests(unittest.TestCase):
     def test_missing_source_boundary_refuses_already_migrated_field(self):
         entry = {"source_html": "<pre>print(1)</pre>", "snippet_id": "fixture-1-0-0"}
@@ -108,10 +151,10 @@ class MigrationExtractionTests(unittest.TestCase):
         self.assertIn('class="rust-keyword"', highlighted)
         self.assertIn('class="rust-string"', highlighted)
         self.assertIn('class="rust-comment"', highlighted)
-        self.assertIn("overflow-wrap:anywhere", highlighted)
-        self.assertIn("word-break:break-word", highlighted)
+        self.assertIn("white-space:pre;", highlighted)
+        self.assertIn("overflow-x:auto", highlighted)
         self.assertIn("max-width:100%", highlighted)
-        self.assertNotIn("overflow-x:auto", highlighted)
+        self.assertNotIn("pre-wrap", highlighted)
 
     def test_highlights_rust_token_kinds(self):
         source = "#[derive(Debug)]\nfn get(&'a self) -> Vec<u32> { self.items(len + 0x1F) }\nprintln!(\"v\"); // done\n"
@@ -128,10 +171,10 @@ class MigrationExtractionTests(unittest.TestCase):
         self.assertIn('onclick="', changed)
         self.assertIn("whiteSpace='pre'", changed)
         self.assertIn("whiteSpace='pre-wrap'", changed)
-        self.assertIn(">wrap: on<", changed)
+        self.assertIn(">wrap: off<", changed)
         self.assertIn('class="rust-snippet"', changed)
         text = html.unescape(re.sub(r"<[^>]+>", "", changed))
-        self.assertIn('fn main() { println!("hi"); }', text.replace("wrap: on", ""))
+        self.assertIn('fn main() { println!("hi"); }', text.replace("wrap: off", ""))
 
     def test_extracts_courier_blocks_groups_and_splits(self):
         field = (
@@ -196,7 +239,11 @@ class MigrationExtractionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for (note_id, field_index), parts in sorted(groups.items()):
                 source = Path(directory) / f"coding_{note_id}_{field_index}.rs"
-                source.write_text("\n\n".join(parts) + "\nfn main() {}\n", encoding="utf-8")
+                kept = assemble_note_parts(parts)
+                body = "\n\n".join(kept)
+                if not re.search(r"(?m)^fn main\b", body):
+                    body += "\nfn main() {}\n"
+                source.write_text(body, encoding="utf-8")
                 binary = Path(directory) / "t"
                 compiled = subprocess.run(
                     ["rustc", "--edition=2021", "--test", str(source), "-o", str(binary)],

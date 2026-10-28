@@ -30,9 +30,14 @@ _BLANK_TEXT_RE = re.compile(r"^[\s\u200b\xa0]*$")
 def _is_courier_paragraph(match: re.Match[str]) -> bool:
     opening = match.group(0)
     opening = opening[: opening.find(">") + 1]
+    if "Courier" in opening:
+        return True
+    # Coding deck solutions use p6-p13 (bare or styled); p1-p5 and
+    # classless paragraphs are headers/labels/prose across the deck.
+    if re.search(r'class="p(?:[6-9]|1[0-3])"', opening):
+        return True
     return (
-        "Courier" in opening
-        or 'class="p2"' in opening
+        'class="p2"' in opening
         or 'class="p3"' in opening
         or 'class="p4"' in opening
     )
@@ -555,8 +560,8 @@ def _code_open_tag() -> str:
     text = _CATPPUCCIN_MOCHA["text"]
     return (
         '<code class="language-rust" style="display:block;box-sizing:border-box;max-width:100%;'
-        f"background-color:{base};color:{text};padding:12px;font-family:monospace;white-space:pre-wrap;"
-        'overflow-wrap:anywhere;word-break:break-word;line-height:1.5;text-align:left;border-radius:4px;">'
+        f"background-color:{base};color:{text};padding:12px;font-family:monospace;white-space:pre;"
+        'overflow-x:auto;line-height:1.5;text-align:left;border-radius:4px;">'
     )
 
 
@@ -598,18 +603,16 @@ def _neutralize_fixed_width_containers(field: str) -> str:
 
 def _ensure_wrap_style(attrs: str) -> str:
     style_match = re.search(r'''(?is)\bstyle\s*=\s*(["'])(.*?)\1''', attrs)
-    wrap = "max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;"
+    wrap = "max-width:100%;white-space:pre;overflow-x:auto;"
     if not style_match:
         return f'{attrs} style="{wrap}"'
     quote, style = style_match.group(1), style_match.group(2)
     if "max-width" not in style:
         style += "max-width:100%;"
-    if "pre-wrap" not in style:
-        style += "white-space:pre-wrap;"
-    if "overflow-wrap" not in style:
-        style += "overflow-wrap:anywhere;"
-    if "word-break" not in style:
-        style += "word-break:break-word;"
+    if "white-space" not in style:
+        style += "white-space:pre;"
+    if "overflow-x" not in style:
+        style += "overflow-x:auto;"
     start, end = style_match.span(2)
     return attrs[:start] + style + attrs[end:]
 
@@ -626,14 +629,15 @@ def _wrap_with_toggle(code_html: str) -> str:
     """Prepend a tap-to-toggle wrap button above a highlighted code block.
 
     Inline onclick works in Anki desktop and AnkiDroid reviewers with no
-    card-template changes. Default state is wrap-on for narrow screens.
+    card-template changes. Default state is wrap-off (unwrapped + horizontal
+    scroll) for narrow screens.
     """
     return (
         '<div class="rust-snippet" style="max-width:100%">'
         '<div style="max-width:100%;text-align:right">'
         '<button class="rust-wrap-toggle" style="font-size:12px;padding:2px 10px;margin:0 0 4px 0;'
         "background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4px;font-family:sans-serif;\""
-        f' onclick="{_WRAP_TOGGLE_SCRIPT}">wrap: on</button></div>'
+        f' onclick="{_WRAP_TOGGLE_SCRIPT}">wrap: off</button></div>'
         + code_html
         + "</div>"
     )
